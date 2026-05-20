@@ -880,15 +880,21 @@ const struct bond_option *bond_opt_get(unsigned int option)
 
 static bool bond_set_xfrm_features(struct bonding *bond)
 {
+	netdev_features_t changed;
+	netdev_features_t wanted = bond->dev->wanted_features;
+
 	if (!IS_ENABLED(CONFIG_XFRM_OFFLOAD))
 		return false;
 
 	if (BOND_MODE(bond) == BOND_MODE_ACTIVEBACKUP)
 		bond->dev->wanted_features |= BOND_XFRM_FEATURES;
-	else
+	else if (!bond_mode_can_use_lag_xfrm(bond))
 		bond->dev->wanted_features &= ~BOND_XFRM_FEATURES;
 
-	return true;
+	changed = wanted ^ bond->dev->wanted_features;
+	changed |= bond->dev->features ^ bond->dev->wanted_features;
+
+	return changed & BOND_XFRM_FEATURES;
 }
 
 static int bond_option_mode_set(struct bonding *bond,
