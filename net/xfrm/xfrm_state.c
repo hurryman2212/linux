@@ -1786,14 +1786,25 @@ static void __xfrm_state_bump_genids(struct xfrm_state *xnew)
 	}
 }
 
-void xfrm_state_insert(struct xfrm_state *x)
+static int xfrm_state_insert_check(struct xfrm_state *x)
 {
 	struct net *net = xs_net(x);
+	int err = -EINVAL;
 
 	spin_lock_bh(&net->xfrm.xfrm_state_lock);
+	if (x->km.state == XFRM_STATE_DEAD)
+		goto out;
 	__xfrm_state_bump_genids(x);
 	__xfrm_state_insert(x);
+	err = 0;
+out:
 	spin_unlock_bh(&net->xfrm.xfrm_state_lock);
+	return err;
+}
+
+void xfrm_state_insert(struct xfrm_state *x)
+{
+	xfrm_state_insert_check(x);
 }
 EXPORT_SYMBOL(xfrm_state_insert);
 
@@ -1896,9 +1907,14 @@ int xfrm_state_add(struct xfrm_state *x)
 
 	family = x->props.family;
 
+	x1 = NULL;
 	to_put = NULL;
 
 	spin_lock_bh(&net->xfrm.xfrm_state_lock);
+	if (x->km.state == XFRM_STATE_DEAD) {
+		err = -EINVAL;
+		goto out;
+	}
 
 	x1 = __xfrm_state_locate(x, use_spi, family);
 	if (x1) {
@@ -2157,7 +2173,8 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
 	if (xfrm_addr_equal(&x->id.daddr, &m->new_daddr, m->new_family)) {
 		/* a care is needed when the destination address of the
 		   state is to be updated as it is a part of triplet */
-		xfrm_state_insert(xc);
+		if (xfrm_state_insert_check(xc) < 0)
+			goto error_add;
 	} else {
 		if (xfrm_state_add(xc) < 0)
 			goto error_add;
@@ -2185,6 +2202,11 @@ int xfrm_state_update(struct xfrm_state *x)
 	to_put = NULL;
 
 	spin_lock_bh(&net->xfrm.xfrm_state_lock);
+	if (x->km.state == XFRM_STATE_DEAD) {
+		err = -EINVAL;
+		goto out;
+	}
+
 	x1 = __xfrm_state_locate(x, use_spi, x->props.family);
 
 	err = -ESRCH;
