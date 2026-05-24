@@ -61,7 +61,7 @@ int eip93_ipsec_xmit(struct eip93_ipsec_sa *sa, struct sk_buff *skb,
 		     unsigned int esp_offset, eip93_ipsec_complete_t complete,
 		     void *data);
 int eip93_ipsec_receive(struct eip93_ipsec_sa *sa, struct sk_buff *skb,
-			unsigned int packet_len,
+			unsigned int esp_offset, unsigned int packet_len,
 			eip93_ipsec_complete_t complete, void *data);
 #else
 static inline struct eip93_ipsec *eip93_ipsec_get(struct device *consumer)
@@ -121,6 +121,7 @@ static inline int eip93_ipsec_xmit(struct eip93_ipsec_sa *sa,
 
 static inline int eip93_ipsec_receive(struct eip93_ipsec_sa *sa,
 				      struct sk_buff *skb,
+				      unsigned int esp_offset,
 				      unsigned int packet_len,
 				      eip93_ipsec_complete_t complete,
 				      void *data)

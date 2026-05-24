@@ -4,6 +4,7 @@
  */
 #include <crypto/eip93-ipsec.h>
 #include <linux/err.h>
+#include <linux/limits.h>
 #include <linux/kmod.h>
 #include <linux/rtnetlink.h>
 #include <linux/slab.h>
@@ -14,6 +15,7 @@
 #include <net/ip6_checksum.h>
 #include <net/ipv6.h>
 #include <net/net_namespace.h>
+#include <net/udp.h>
 #include <net/xfrm.h>
 
 #include "airoha_eth.h"
@@ -195,9 +197,18 @@ static bool airoha_xfrm_state_supported(struct xfrm_state *x,
 	}
 
 	if (x->encap) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "NAT-T is unsupported by EIP93 packet ESP");
-		return false;
+		switch (x->encap->encap_type) {
+		case UDP_ENCAP_ESPINUDP:
+			break;
+		case UDP_ENCAP_ESPINUDP_NON_IKE:
+			NL_SET_ERR_MSG_MOD(extack,
+					   "non-IKE UDP-encap ESP is unsupported");
+			return false;
+		default:
+			NL_SET_ERR_MSG_MOD(extack,
+					   "only UDP_ENCAP_ESPINUDP is supported");
+			return false;
+		}
 	}
 
 	if (x->tfcpad) {
@@ -443,14 +454,20 @@ static bool airoha_xfrm_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
 
 /*
  * EIP93 packet-out mode creates ESP padding, trailer and ICV. The generic ESP
- * xmit path should reserve tailroom only for plain, non-GSO ESP packets.
+ * xmit path should reserve tailroom only for plain or NAT-T non-GSO ESP
+ * packets.
  */
 static bool airoha_xfrm_esp_tx_hw_trailer(struct sk_buff *skb,
 					  struct xfrm_state *x)
 {
-	return x->xso.dir == XFRM_DEV_OFFLOAD_OUT &&
-	       x->xso.type == XFRM_DEV_OFFLOAD_CRYPTO && !x->encap &&
-	       !skb_is_gso(skb);
+	if (x->xso.dir != XFRM_DEV_OFFLOAD_OUT ||
+	    x->xso.type != XFRM_DEV_OFFLOAD_CRYPTO || skb_is_gso(skb))
+		return false;
+
+	if (!x->encap)
+		return true;
+
+	return x->encap->encap_type == UDP_ENCAP_ESPINUDP;
 }
 
 static const struct xfrmdev_ops airoha_xfrmdev_ops = {
@@ -550,6 +567,7 @@ int airoha_xfrm_set_features(struct net_device *dev, netdev_features_t features)
 struct airoha_xfrm_rx_info {
 	unsigned short family;
 	int encap_type;
+	int udp_offset;
 	int esp_offset;
 	int packet_len;
 	__be32 spi;
@@ -590,6 +608,7 @@ static bool airoha_xfrm_parse_rx_ipv4(struct sk_buff *skb,
 	switch (iph->protocol) {
 	case IPPROTO_ESP:
 		info->encap_type = 0;
+		info->udp_offset = -1;
 		info->esp_offset = iphlen;
 		info->packet_len = packet_len;
 		break;
@@ -604,7 +623,7 @@ static bool airoha_xfrm_parse_rx_ipv4(struct sk_buff *skb,
 		uh = (struct udphdr *)(skb->data + iphlen);
 		udp_len = ntohs(uh->len);
 		if (udp_len <= sizeof(*uh) + sizeof(*esph) ||
-		    iphlen + udp_len > packet_len)
+		    iphlen + udp_len != packet_len)
 			return false;
 
 		memcpy(&marker, skb->data + iphlen + sizeof(*uh),
@@ -613,6 +632,7 @@ static bool airoha_xfrm_parse_rx_ipv4(struct sk_buff *skb,
 			return false;
 
 		info->encap_type = UDP_ENCAP_ESPINUDP;
+		info->udp_offset = iphlen;
 		info->esp_offset = iphlen + sizeof(*uh);
 		info->packet_len = iphlen + udp_len;
 		break;
@@ -666,6 +686,7 @@ static bool airoha_xfrm_parse_rx_ipv6(struct sk_buff *skb,
 	switch (nexthdr) {
 	case NEXTHDR_ESP:
 		info->encap_type = 0;
+		info->udp_offset = -1;
 		info->esp_offset = offset;
 		info->packet_len = packet_len;
 		break;
@@ -680,7 +701,7 @@ static bool airoha_xfrm_parse_rx_ipv6(struct sk_buff *skb,
 		uh = (struct udphdr *)(skb->data + offset);
 		udp_len = ntohs(uh->len);
 		if (udp_len <= sizeof(*uh) + sizeof(*esph) ||
-		    offset + udp_len > packet_len)
+		    offset + udp_len != packet_len)
 			return false;
 
 		memcpy(&marker, skb->data + offset + sizeof(*uh),
@@ -689,6 +710,7 @@ static bool airoha_xfrm_parse_rx_ipv6(struct sk_buff *skb,
 			return false;
 
 		info->encap_type = UDP_ENCAP_ESPINUDP;
+		info->udp_offset = offset;
 		info->esp_offset = offset + sizeof(*uh);
 		info->packet_len = offset + udp_len;
 		break;
@@ -727,6 +749,61 @@ static bool airoha_xfrm_parse_rx_skb(struct sk_buff *skb,
 	default:
 		return false;
 	}
+}
+
+static bool
+airoha_xfrm_rx_udp_packet_valid(struct sk_buff *skb,
+				const struct xfrm_state *x,
+				const struct airoha_xfrm_rx_info *info)
+{
+	const struct udphdr *uh;
+	__sum16 check;
+	__wsum csum;
+	int udp_len;
+
+	if (info->encap_type != UDP_ENCAP_ESPINUDP)
+		return true;
+
+	if (!x->encap || info->udp_offset < 0 ||
+	    info->udp_offset + sizeof(*uh) > info->packet_len)
+		return false;
+
+	uh = (const struct udphdr *)(skb->data + info->udp_offset);
+	udp_len = ntohs(uh->len);
+	if (udp_len <= sizeof(*uh) ||
+	    info->udp_offset + udp_len != info->packet_len)
+		return false;
+
+	if (uh->dest != x->encap->encap_dport)
+		return false;
+
+	/*
+	 * RX ESP packet offload runs before the UDP layer. Validate non-zero
+	 * IPv4 checksums and mandatory IPv6 checksums before EIP93 mutates and
+	 * shrinks the packet, otherwise completion-side checksum repair could
+	 * hide a bad on-wire NAT-T packet.
+	 */
+	if (info->family == AF_INET && !uh->check)
+		return true;
+
+	csum = skb_checksum(skb, info->udp_offset, udp_len, 0);
+	if (info->family == AF_INET) {
+		const struct iphdr *iph = ip_hdr(skb);
+
+		check = udp_v4_check(udp_len, iph->saddr, iph->daddr, csum);
+	} else if (IS_ENABLED(CONFIG_IPV6) && info->family == AF_INET6) {
+		const struct ipv6hdr *ip6h = ipv6_hdr(skb);
+
+		if (!uh->check)
+			return false;
+
+		check = csum_ipv6_magic(&ip6h->saddr, &ip6h->daddr, udp_len,
+					IPPROTO_UDP, csum);
+	} else {
+		return false;
+	}
+
+	return !check;
 }
 
 static struct xfrm_state *
@@ -818,6 +895,34 @@ static int airoha_xfrm_rx_apply_result(struct sk_buff *skb,
 		return -EINVAL;
 
 	if (x->props.family == AF_INET) {
+		if (x->encap &&
+		    x->encap->encap_type == UDP_ENCAP_ESPINUDP) {
+			struct iphdr *iph = ip_hdr(skb);
+			struct udphdr *uh;
+			unsigned int iphlen;
+			unsigned int udplen;
+
+			iphlen = iph->ihl * 4;
+			if (iphlen < sizeof(*iph) ||
+			    skb_network_offset(skb) + iphlen + sizeof(*uh) >
+				    skb->len)
+				return -EINVAL;
+
+			udplen = skb->len - skb_network_offset(skb) - iphlen;
+			if (udplen > U16_MAX)
+				return -EINVAL;
+
+			uh = (struct udphdr *)(skb_network_header(skb) +
+					       iphlen);
+			uh->len = htons(udplen);
+			/*
+			 * Hardware ESP decapsulation changes the UDP payload
+			 * before the IPv4 UDP layer sees it. A zero checksum
+			 * keeps the packet on the normal NAT-T decap path after
+			 * ESP authentication has already succeeded.
+			 */
+			uh->check = 0;
+		}
 		ip_hdr(skb)->tot_len = htons(skb->len);
 		ip_send_check(ip_hdr(skb));
 	} else if (x->props.family == AF_INET6) {
@@ -826,6 +931,40 @@ static int airoha_xfrm_rx_apply_result(struct sk_buff *skb,
 
 		if (len < 0)
 			return -EINVAL;
+
+		if (x->encap &&
+		    x->encap->encap_type == UDP_ENCAP_ESPINUDP) {
+			const struct ipv6hdr *ip6h = ipv6_hdr(skb);
+			unsigned int udplen;
+			__be16 frag_off;
+			struct udphdr *uh;
+			__wsum csum;
+			int offset;
+			u8 nexthdr;
+
+			nexthdr = ip6h->nexthdr;
+			offset = ipv6_skip_exthdr(skb,
+						  skb_network_offset(skb) +
+							  sizeof(*ip6h),
+						  &nexthdr, &frag_off);
+			if (offset < 0 || frag_off || nexthdr != NEXTHDR_UDP ||
+			    offset + sizeof(*uh) > skb->len)
+				return -EINVAL;
+
+			udplen = skb->len - offset;
+			if (udplen > U16_MAX)
+				return -EINVAL;
+
+			uh = (struct udphdr *)(skb->data + offset);
+			uh->len = htons(udplen);
+			uh->check = 0;
+			csum = skb_checksum(skb, offset, udplen, 0);
+			uh->check = csum_ipv6_magic(&ip6h->saddr, &ip6h->daddr,
+						    udplen, IPPROTO_UDP, csum);
+			if (!uh->check)
+				uh->check = CSUM_MANGLED_0;
+			skb->ip_summed = CHECKSUM_UNNECESSARY;
+		}
 
 		ipv6_hdr(skb)->payload_len = len > IPV6_MAXPLEN ? 0 :
 								      htons(len);
@@ -898,6 +1037,28 @@ static void airoha_xfrm_tx_update_outer_len(struct sk_buff *skb)
 	}
 }
 
+static void airoha_xfrm_tx_update_udp_len(struct sk_buff *skb,
+					  struct xfrm_state *x)
+{
+	struct udphdr *uh;
+	unsigned int len;
+	unsigned int offset;
+
+	if (!x->encap || x->encap->encap_type != UDP_ENCAP_ESPINUDP)
+		return;
+
+	offset = skb_transport_offset(skb);
+	if (offset + sizeof(*uh) > skb->len)
+		return;
+
+	len = skb->len - offset;
+	if (len > U16_MAX)
+		return;
+
+	uh = udp_hdr(skb);
+	uh->len = htons(len);
+}
+
 static void airoha_xfrm_tx_udp6_csum(struct sk_buff *skb,
 				     struct xfrm_state *x)
 {
@@ -928,7 +1089,7 @@ static void airoha_xfrm_tx_udp6_csum(struct sk_buff *skb,
 				    IPPROTO_UDP, csum);
 	if (!uh->check)
 		uh->check = CSUM_MANGLED_0;
-	#endif
+#endif
 }
 
 static int airoha_xfrm_tx_apply_result(struct sk_buff *skb,
@@ -989,6 +1150,9 @@ bool airoha_xfrm_rx_skb(struct airoha_gdm_port *port, struct sk_buff *skb)
 	if (!x)
 		return false;
 
+	if (!airoha_xfrm_rx_udp_packet_valid(skb, x, &info))
+		goto err_put_state;
+
 	sp = secpath_set(skb);
 	if (!sp)
 		goto err_put_state;
@@ -1046,8 +1210,9 @@ bool airoha_xfrm_rx_skb(struct airoha_gdm_port *port, struct sk_buff *skb)
 	skb->ip_summed = CHECKSUM_NONE;
 
 	dev_hold(ctx->dev);
-	err = eip93_ipsec_receive(state->sa, skb, info.packet_len,
-				  airoha_xfrm_rx_finish, ctx);
+	err = eip93_ipsec_receive(state->sa, skb,
+				  info.encap_type ? info.esp_offset : 0,
+				  info.packet_len, airoha_xfrm_rx_finish, ctx);
 	if (err == -EINPROGRESS)
 		return true;
 
@@ -1093,6 +1258,7 @@ static void airoha_xfrm_tx_done(void *data, int err,
 	}
 
 	airoha_xfrm_tx_update_outer_len(skb);
+	airoha_xfrm_tx_update_udp_len(skb, x);
 	airoha_xfrm_tx_udp6_csum(skb, x);
 	xo->flags |= CRYPTO_DONE;
 	xo->status = CRYPTO_SUCCESS;

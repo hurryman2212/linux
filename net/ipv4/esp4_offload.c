@@ -27,6 +27,38 @@
 #include <linux/spinlock.h>
 #include <net/udp.h>
 
+static int esp4_output_udp_hw_trailer(struct xfrm_state *x,
+				      struct sk_buff *skb,
+				      struct esp_info *esp)
+{
+	struct xfrm_encap_tmpl *encap = x->encap;
+	struct udphdr *uh;
+	unsigned int len;
+	__be16 sport;
+	__be16 dport;
+
+	if (!encap || encap->encap_type != UDP_ENCAP_ESPINUDP)
+		return -EOPNOTSUPP;
+
+	len = skb->len + esp->tailen - skb_transport_offset(skb);
+	if (len + sizeof(struct iphdr) > IP_MAX_MTU)
+		return -EMSGSIZE;
+
+	spin_lock_bh(&x->lock);
+	sport = encap->encap_sport;
+	dport = encap->encap_dport;
+	spin_unlock_bh(&x->lock);
+
+	uh = (struct udphdr *)esp->esph;
+	uh->source = sport;
+	uh->dest = dport;
+	uh->len = htons(len);
+	uh->check = 0;
+	esp->esph = (struct ip_esp_hdr *)(uh + 1);
+
+	return 0;
+}
+
 static struct sk_buff *esp4_gro_receive(struct list_head *head,
 					struct sk_buff *skb)
 {
@@ -314,7 +346,8 @@ static int esp_xmit(struct xfrm_state *x, struct sk_buff *skb,  netdev_features_
 	if (x->encap)
 		encap_type = x->encap->encap_type;
 
-	if (hw_offload && !skb_is_gso(skb) && !encap_type && x->xso.dev &&
+	if (hw_offload && !skb_is_gso(skb) &&
+	    (!encap_type || encap_type == UDP_ENCAP_ESPINUDP) && x->xso.dev &&
 	    x->xso.dev->xfrmdev_ops &&
 	    x->xso.dev->xfrmdev_ops->xdo_dev_esp_tx_hw_trailer)
 		hw_trailer =
@@ -322,12 +355,19 @@ static int esp_xmit(struct xfrm_state *x, struct sk_buff *skb,  netdev_features_
 
 	if (hw_trailer) {
 		int esph_offset;
+		int err;
 
 		/*
 		 * The device packet engine will write ESP padding, next-header
 		 * and ICV bytes. Keep skb->len unchanged here, but make sure the
 		 * later DMA writer owns enough linear tailroom.
 		 */
+		if (encap_type) {
+			err = esp4_output_udp_hw_trailer(x, skb, &esp);
+			if (err)
+				return err;
+		}
+
 		esph_offset = (unsigned char *)esp.esph - skb_transport_header(skb);
 		esp.nfrags = skb_cow_data(skb, esp.tailen, &trailer);
 		if (esp.nfrags < 0)

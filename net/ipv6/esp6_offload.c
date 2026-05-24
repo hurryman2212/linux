@@ -27,7 +27,42 @@
 #include <linux/spinlock.h>
 #include <net/ip6_route.h>
 #include <net/ipv6.h>
+#include <net/udp.h>
 #include <linux/icmpv6.h>
+
+static int esp6_output_udp_hw_trailer(struct xfrm_state *x,
+				      struct sk_buff *skb,
+				      struct esp_info *esp)
+{
+	struct xfrm_encap_tmpl *encap = x->encap;
+	struct udphdr *uh;
+	unsigned int len;
+	__be16 sport;
+	__be16 dport;
+
+	if (!encap || encap->encap_type != UDP_ENCAP_ESPINUDP)
+		return -EOPNOTSUPP;
+
+	len = skb->len + esp->tailen - skb_transport_offset(skb);
+	if (len > U16_MAX)
+		return -EMSGSIZE;
+
+	spin_lock_bh(&x->lock);
+	sport = encap->encap_sport;
+	dport = encap->encap_dport;
+	spin_unlock_bh(&x->lock);
+
+	uh = (struct udphdr *)esp->esph;
+	uh->source = sport;
+	uh->dest = dport;
+	uh->len = htons(len);
+	uh->check = 0;
+	esp->esph = (struct ip_esp_hdr *)(uh + 1);
+
+	*skb_mac_header(skb) = IPPROTO_UDP;
+
+	return 0;
+}
 
 static __u16 esp6_nexthdr_esp_offset(struct ipv6hdr *ipv6_hdr, int nhlen)
 {
@@ -313,6 +348,7 @@ static int esp6_xmit(struct xfrm_state *x, struct sk_buff *skb,  netdev_features
 	bool hw_offload = true;
 	bool hw_trailer = false;
 	__u32 seq;
+	int encap_type = 0;
 
 	esp.inplace = true;
 
@@ -344,7 +380,13 @@ static int esp6_xmit(struct xfrm_state *x, struct sk_buff *skb,  netdev_features
 	if (esp.tailen > U16_MAX)
 		return -EINVAL;
 
-	if (hw_offload && !skb_is_gso(skb) && !x->encap && x->xso.dev &&
+	esp.esph = ip_esp_hdr(skb);
+
+	if (x->encap)
+		encap_type = x->encap->encap_type;
+
+	if (hw_offload && !skb_is_gso(skb) &&
+	    (!encap_type || encap_type == UDP_ENCAP_ESPINUDP) && x->xso.dev &&
 	    x->xso.dev->xfrmdev_ops &&
 	    x->xso.dev->xfrmdev_ops->xdo_dev_esp_tx_hw_trailer)
 		hw_trailer =
@@ -358,7 +400,12 @@ static int esp6_xmit(struct xfrm_state *x, struct sk_buff *skb,  netdev_features
 		 * and ICV bytes. Keep skb->len unchanged here, but make sure the
 		 * later DMA writer owns enough linear tailroom.
 		 */
-		esp.esph = ip_esp_hdr(skb);
+		if (encap_type) {
+			err = esp6_output_udp_hw_trailer(x, skb, &esp);
+			if (err)
+				return err;
+		}
+
 		esph_offset = (unsigned char *)esp.esph - skb_transport_header(skb);
 		esp.nfrags = skb_cow_data(skb, esp.tailen, &trailer);
 		if (esp.nfrags < 0)
@@ -366,7 +413,8 @@ static int esp6_xmit(struct xfrm_state *x, struct sk_buff *skb,  netdev_features
 		esp.esph = (struct ip_esp_hdr *)(skb_transport_header(skb) +
 						 esph_offset);
 		xo->esp_tx_tailen = esp.tailen;
-	} else if (!hw_offload || !skb_is_gso(skb)) {
+	} else if (!hw_offload || !skb_is_gso(skb) ||
+		   (hw_offload && encap_type == UDP_ENCAP_ESPINUDP)) {
 		esp.nfrags = esp6_output_head(x, skb, &esp);
 		if (esp.nfrags < 0)
 			return esp.nfrags;
@@ -374,7 +422,6 @@ static int esp6_xmit(struct xfrm_state *x, struct sk_buff *skb,  netdev_features
 
 	seq = xo->seq.low;
 
-	esp.esph = ip_esp_hdr(skb);
 	esp.esph->spi = x->id.spi;
 
 	skb_push(skb, -skb_network_offset(skb));

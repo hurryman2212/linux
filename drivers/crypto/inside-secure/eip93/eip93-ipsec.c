@@ -87,6 +87,7 @@ struct eip93_ipsec_request {
 	void *data;
 	dma_addr_t dma;
 	unsigned int dma_len;
+	unsigned int result_offset;
 	enum dma_data_direction dma_dir;
 	int idr;
 };
@@ -541,9 +542,18 @@ static int eip93_ipsec_validate_state(struct xfrm_state *x,
 	}
 
 	if (x->encap) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "NAT-T is unsupported by EIP93 packet ESP");
-		return -EOPNOTSUPP;
+		switch (x->encap->encap_type) {
+		case UDP_ENCAP_ESPINUDP:
+			break;
+		case UDP_ENCAP_ESPINUDP_NON_IKE:
+			NL_SET_ERR_MSG_MOD(extack,
+					   "non-IKE UDP-encap ESP is unsupported");
+			return -EOPNOTSUPP;
+		default:
+			NL_SET_ERR_MSG_MOD(extack,
+					   "only UDP_ENCAP_ESPINUDP is supported");
+			return -EOPNOTSUPP;
+		}
 	}
 
 	if (x->tfcpad) {
@@ -983,6 +993,13 @@ void eip93_ipsec_handle_result(struct eip93_ipsec_request *req, int err,
 
 	if (!err) {
 		result.packet_len = FIELD_GET(EIP93_PE_LENGTH_LENGTH, pe_length);
+		if (result.packet_len >
+		    FIELD_MAX(EIP93_PE_LENGTH_LENGTH) - req->result_offset) {
+			err = -EINVAL;
+			result.packet_len = 0;
+		} else {
+			result.packet_len += req->result_offset;
+		}
 		result.nexthdr = FIELD_GET(EIP93_PE_CTRL_PE_PAD_VALUE,
 					   pe_ctrl_stat);
 	}
@@ -1300,6 +1317,7 @@ int eip93_ipsec_xmit(struct eip93_ipsec_sa *sa, struct sk_buff *skb,
 	req->complete = complete;
 	req->data = data;
 	req->dma_len = dma_len;
+	req->result_offset = 0;
 	req->dma_dir = DMA_BIDIRECTIONAL;
 	req->dma = dma_map_single(sa->ipsec->eip93->dev, skb->data,
 				  req->dma_len, req->dma_dir);
@@ -1343,11 +1361,12 @@ put_sa:
 EXPORT_SYMBOL_GPL(eip93_ipsec_xmit);
 
 int eip93_ipsec_receive(struct eip93_ipsec_sa *sa, struct sk_buff *skb,
-			unsigned int packet_len,
+			unsigned int esp_offset, unsigned int packet_len,
 			eip93_ipsec_complete_t complete, void *data)
 {
 	struct eip93_descriptor cdesc = {};
 	struct eip93_ipsec_request *req;
+	unsigned int payload_len;
 	int err;
 
 	if (!sa || !complete || !eip93_ipsec_sa_get(sa))
@@ -1371,12 +1390,20 @@ int eip93_ipsec_receive(struct eip93_ipsec_sa *sa, struct sk_buff *skb,
 	req->complete = complete;
 	req->data = data;
 	if (!packet_len || packet_len > skb->len ||
-	    packet_len > FIELD_MAX(EIP93_PE_LENGTH_LENGTH)) {
+	    packet_len > FIELD_MAX(EIP93_PE_LENGTH_LENGTH) ||
+	    esp_offset > packet_len) {
+		err = -EINVAL;
+		goto free_req;
+	}
+	payload_len = packet_len - esp_offset;
+	if (payload_len <= sizeof(struct ip_esp_hdr) + sa->ivsize ||
+	    payload_len > FIELD_MAX(EIP93_PE_LENGTH_LENGTH)) {
 		err = -EINVAL;
 		goto free_req;
 	}
 
 	req->dma_len = packet_len;
+	req->result_offset = esp_offset;
 	req->dma_dir = DMA_BIDIRECTIONAL;
 	req->dma = dma_map_single(sa->ipsec->eip93->dev, skb->data,
 				  req->dma_len, req->dma_dir);
@@ -1391,12 +1418,12 @@ int eip93_ipsec_receive(struct eip93_ipsec_sa *sa, struct sk_buff *skb,
 		FIELD_PREP(EIP93_PE_CTRL_PE_PAD_CTRL_STAT,
 			   EIP93_IPSEC_PAD_ALIGN) |
 		EIP93_PE_CTRL_PE_HASH_FINAL;
-	cdesc.src_addr = (u32 __force)req->dma;
-	cdesc.dst_addr = (u32 __force)req->dma;
+	cdesc.src_addr = (u32 __force)req->dma + esp_offset;
+	cdesc.dst_addr = (u32 __force)req->dma + esp_offset;
 	cdesc.sa_addr = sa->sa_record_base;
 	cdesc.pe_length_word = FIELD_PREP(EIP93_PE_LENGTH_HOST_PE_READY,
 					  EIP93_PE_LENGTH_HOST_READY) |
-			       FIELD_PREP(EIP93_PE_LENGTH_LENGTH, req->dma_len);
+			       FIELD_PREP(EIP93_PE_LENGTH_LENGTH, payload_len);
 
 	err = eip93_ipsec_submit(req, &cdesc);
 	if (err == -EINPROGRESS)
