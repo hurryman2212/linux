@@ -232,6 +232,7 @@ struct net_device_core_stats {
 
 struct neighbour;
 struct neigh_parms;
+struct flow_keys;
 struct sk_buff;
 
 struct netdev_hw_addr {
@@ -937,6 +938,7 @@ struct net_device_path_stack {
 
 struct net_device_path_ctx {
 	const struct net_device *dev;
+	const struct flow_keys	*flow;
 	u8			daddr[ETH_ALEN];
 
 	int			num_vlans;
@@ -3394,6 +3396,9 @@ int dev_get_iflink(const struct net_device *dev);
 int dev_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb);
 int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
 			  struct net_device_path_stack *stack);
+int dev_fill_forward_path_flow(const struct net_device *dev, const u8 *daddr,
+			       const struct flow_keys *flow,
+			       struct net_device_path_stack *stack);
 struct net_device *dev_get_by_name(struct net *net, const char *name);
 struct net_device *dev_get_by_name_rcu(struct net *net, const char *name);
 struct net_device *__dev_get_by_name(struct net *net, const char *name);

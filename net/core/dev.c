@@ -750,12 +750,14 @@ static struct net_device_path *dev_fwd_path(struct net_device_path_stack *stack)
 	return &stack->path[k];
 }
 
-int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
-			  struct net_device_path_stack *stack)
+int dev_fill_forward_path_flow(const struct net_device *dev, const u8 *daddr,
+			       const struct flow_keys *flow,
+			       struct net_device_path_stack *stack)
 {
 	const struct net_device *last_dev;
 	struct net_device_path_ctx ctx = {
 		.dev	= dev,
+		.flow	= flow,
 	};
 	struct net_device_path *path;
 	int ret = 0;
@@ -787,6 +789,13 @@ int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
 	path->dev = ctx.dev;
 
 	return ret;
+}
+EXPORT_SYMBOL_GPL(dev_fill_forward_path_flow);
+
+int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
+			  struct net_device_path_stack *stack)
+{
+	return dev_fill_forward_path_flow(dev, daddr, NULL, stack);
 }
 EXPORT_SYMBOL_GPL(dev_fill_forward_path);
 
