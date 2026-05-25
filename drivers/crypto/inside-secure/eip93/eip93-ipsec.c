@@ -534,12 +534,11 @@ static int eip93_ipsec_validate_state(struct xfrm_state *x,
 		NL_SET_ERR_MSG_MOD(extack, "only tunnel/transport");
 		return -EOPNOTSUPP;
 	}
-
-	if (x->outer_mode.encap != x->props.mode) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "outer ESP mode does not match state mode");
-		return -EOPNOTSUPP;
-	}
+	/*
+	 * EIP93 packet mode only transforms the outer ESP packet. Linux XFRM
+	 * mode callbacks still own transport and tunnel header processing,
+	 * including same-family and cross-family tunnel payloads.
+	 */
 
 	if (x->encap) {
 		switch (x->encap->encap_type) {

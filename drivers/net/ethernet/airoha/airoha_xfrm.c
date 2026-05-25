@@ -189,12 +189,11 @@ static bool airoha_xfrm_state_supported(struct xfrm_state *x,
 				   "only tunnel/transport modes are supported");
 		return false;
 	}
-
-	if (x->outer_mode.encap != x->props.mode) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "outer ESP mode does not match state mode");
-		return false;
-	}
+	/*
+	 * Airoha only submits the ESP packet to EIP93. Linux XFRM mode
+	 * callbacks still own transport and tunnel header processing,
+	 * including same-family and cross-family tunnel payloads.
+	 */
 
 	if (x->encap) {
 		switch (x->encap->encap_type) {
