@@ -8,6 +8,7 @@
 #include <linux/spinlock.h>
 #include <linux/netfilter/nf_conntrack_common.h>
 #include <linux/netfilter/nf_tables.h>
+#include <net/flow_dissector.h>
 #include <net/ip.h>
 #include <net/inet_dscp.h>
 #include <net/netfilter/nf_tables.h>
@@ -45,6 +46,7 @@ static bool nft_is_valid_ether_device(const struct net_device *dev)
 static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
 				     const struct dst_entry *dst_cache,
 				     const struct nf_conn *ct,
+				     const struct flow_keys *flow,
 				     enum ip_conntrack_dir dir, u8 *ha,
 				     struct net_device_path_stack *stack)
 {
@@ -70,12 +72,48 @@ static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
 		return -1;
 
 out:
-	return dev_fill_forward_path(dev, ha, stack);
+	return dev_fill_forward_path_flow(dev, ha, flow, stack);
+}
+
+static void nft_flow_keys_init(const struct nf_conn *ct,
+			       enum ip_conntrack_dir dir,
+			       struct flow_keys *flow)
+{
+	const struct nf_conntrack_tuple *tuple = &ct->tuplehash[dir].tuple;
+	const struct nf_conntrack_tuple *other = &ct->tuplehash[!dir].tuple;
+
+	memset(flow, 0, sizeof(*flow));
+
+	/* Match the packet tuple after flowtable NAT mangling. */
+	switch (tuple->src.l3num) {
+	case NFPROTO_IPV4:
+		flow->control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
+		flow->basic.n_proto = htons(ETH_P_IP);
+		flow->addrs.v4addrs.src = other->dst.u3.ip;
+		flow->addrs.v4addrs.dst = other->src.u3.ip;
+		break;
+	case NFPROTO_IPV6:
+		flow->control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
+		flow->basic.n_proto = htons(ETH_P_IPV6);
+		flow->addrs.v6addrs.src = other->dst.u3.in6;
+		flow->addrs.v6addrs.dst = other->src.u3.in6;
+		break;
+	}
+
+	flow->basic.ip_proto = tuple->dst.protonum;
+	switch (tuple->dst.protonum) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP:
+		flow->ports.src = other->dst.u.all;
+		flow->ports.dst = other->src.u.all;
+		break;
+	}
 }
 
 struct nft_forward_info {
 	const struct net_device *indev;
 	const struct net_device *outdev;
+	const struct net_device *hw_outdev;
 	struct id {
 		__u16	id;
 		__be16	proto;
@@ -105,6 +143,7 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
 		case DEV_PATH_ETHERNET:
 		case DEV_PATH_DSA:
 		case DEV_PATH_VLAN:
+		case DEV_PATH_LAG:
 		case DEV_PATH_PPPOE:
 		case DEV_PATH_TUN:
 			info->indev = path->dev;
@@ -113,6 +152,10 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
 
 			if (path->type == DEV_PATH_ETHERNET)
 				break;
+			if (path->type == DEV_PATH_LAG) {
+				info->outdev = path->dev;
+				break;
+			}
 			if (path->type == DEV_PATH_DSA) {
 				i = stack->num_paths;
 				break;
@@ -178,7 +221,9 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
 			break;
 		}
 	}
-	info->outdev = info->indev;
+	if (!info->outdev)
+		info->outdev = info->indev;
+	info->hw_outdev = info->indev;
 
 	if (nf_flowtable_hw_offload(flowtable) &&
 	    nft_is_valid_ether_device(info->indev))
@@ -249,10 +294,13 @@ static void nft_dev_forward_path(const struct nft_pktinfo *pkt,
 	const struct dst_entry *dst = route->tuple[dir].dst;
 	struct net_device_path_stack stack;
 	struct nft_forward_info info = {};
+	struct flow_keys flow;
 	unsigned char ha[ETH_ALEN];
 	int i;
 
-	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
+	nft_flow_keys_init(ct, dir, &flow);
+	if (nft_dev_fill_forward_path(route, dst, ct, &flow, dir, ha,
+				      &stack) >= 0)
 		nft_dev_path_info(&stack, &info, ha, &ft->data);
 
 	if (info.outdev)
@@ -281,6 +329,7 @@ static void nft_dev_forward_path(const struct nft_pktinfo *pkt,
 	if (info.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT) {
 		memcpy(route->tuple[dir].out.h_source, info.h_source, ETH_ALEN);
 		memcpy(route->tuple[dir].out.h_dest, info.h_dest, ETH_ALEN);
+		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
 		route->tuple[dir].xmit_type = info.xmit_type;
 	}
 	route->tuple[dir].out.needs_gso_segment = info.needs_gso_segment;
